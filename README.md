@@ -1,0 +1,178 @@
+# Квитто: платёжный REST API
+
+Обязательная часть тестового задания: Python 3.11+, FastAPI, Pydantic v2,
+PostgreSQL 16, синхронный SQLAlchemy 2.0, psycopg 3, pytest и httpx.
+
+## Запуск в Windows PowerShell
+
+Команды выполняются из корня репозитория. Нужны Python 3.11+ и работающий Docker
+Desktop. Активация виртуального окружения не требуется, поэтому менять PowerShell
+ExecutionPolicy не нужно.
+
+```powershell
+py -3 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -e '.[test]'
+if (-not (Test-Path .env)) { Copy-Item .env.example .env }
+docker compose up -d --wait db
+docker compose ps
+.\.venv\Scripts\python.exe -m uvicorn app.main:app --env-file .env --host 127.0.0.1 --port 8000
+```
+
+Если `.venv` уже существует и создан на Python 3.11+, первый шаг можно пропустить.
+Ожидаемый статус БД в `docker compose ps`: `healthy`. Приложение доступно по
+`http://127.0.0.1:8000`, Swagger UI: `http://127.0.0.1:8000/docs`.
+Остановить сервер можно сочетанием Ctrl+C.
+
+Существующий `compose.yaml` запускает только PostgreSQL. API запускается на хосте,
+а не внутри Docker. Подключение в `.env.example` соответствует этому Compose:
+`127.0.0.1:5433`, пользователь `kvitto`, основная БД `kvitto`.
+Локальный пароль из Compose предназначен для разработки. `.env` игнорируется Git.
+Переменные окружения PowerShell имеют приоритет над значениями `.env`.
+
+На старте создаются отсутствующие таблицы и добавляются тарифы. Повторный запуск
+обновляет канонические цены по уникальному названию без создания дубликатов.
+`create_all` не изменяет уже существующую структуру таблиц; миграции в обязательную
+часть не входят. Для чистой БД используется один процесс инициализации приложения.
+
+## Отдельная база и запуск тестов
+
+Создать `kvitto_test` один раз, не меняя Compose и основную БД:
+
+```powershell
+$databaseExists = docker compose exec -T db psql -U kvitto -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname = 'kvitto_test'"
+if ($LASTEXITCODE -ne 0) { throw 'Не удалось проверить наличие тестовой БД' }
+if (($databaseExists -join '').Trim() -ne '1') {
+    docker compose exec -T db createdb -U kvitto -O kvitto kvitto_test
+    if ($LASTEXITCODE -ne 0) { throw 'Не удалось создать kvitto_test' }
+}
+.\.venv\Scripts\python.exe -m pytest -q
+```
+
+Тесты читают `TEST_DATABASE_URL` из окружения или `.env`. Значение по умолчанию:
+`postgresql+psycopg://kvitto:kvitto_local@127.0.0.1:5433/kvitto_test`.
+`DATABASE_URL` приложения не используется для тестового подключения.
+
+Фикстура проверяет и имя в URL, и результат `SELECT current_database()` до создания
+таблиц или очистки. Разрешена только БД `kvitto_test`, без query-параметров URL.
+Перед каждым тестом и после него очищается таблица `payments` **только в тестовой
+БД**. Не храните в ней нужные данные. Параллельный запуск нескольких pytest-процессов
+с общей тестовой БД не поддерживается. Конкурентные HTTP-запросы внутри тестов
+проверяются через независимые SQLAlchemy-сессии и соединения.
+
+Покрыты деньги и промокоды, полный ответ платежа, все сроки рассрочки,
+валидация, повторные и конкурентные запросы с ключом, все 16 пар статусов,
+конкурирующие вебхуки, 404 и ограничения реальной PostgreSQL.
+
+## Примеры запросов в PowerShell
+
+Используется `curl.exe`, чтобы избежать alias `curl` в Windows PowerShell 5.1.
+JSON передаётся через stdin: это работает без особенностей экранирования кавычек
+в аргументах нативных программ разных версий PowerShell.
+
+```powershell
+curl.exe -i http://127.0.0.1:8000/tariffs
+
+$tariffs = Invoke-RestMethod http://127.0.0.1:8000/tariffs
+$tariffId = ($tariffs | Where-Object { $_.title -eq 'standard' }).id
+$body = @{
+    tariff_id = $tariffId
+    email = 'student@example.com'
+    method = 'installment'
+    installment_months = 3
+    promo_code = 'kvitto10'
+} | ConvertTo-Json -Compress
+
+# Первый запрос: 201. Для каждого нового примера выбирайте новый ключ.
+$body | curl.exe -sS -i -X POST http://127.0.0.1:8000/payments -H 'Content-Type: application/json' -H 'Idempotency-Key: powershell-demo-1' --data-binary '@-'
+
+# Повтор: 200, тот же платёж. Его ID нужен для следующих запросов.
+$payment = ($body | curl.exe -sS -X POST http://127.0.0.1:8000/payments -H 'Content-Type: application/json' -H 'Idempotency-Key: powershell-demo-1' --data-binary '@-') | ConvertFrom-Json
+curl.exe -i "http://127.0.0.1:8000/payments/$($payment.id)"
+
+$webhook = @{ payment_id = $payment.id; status = 'succeeded' } | ConvertTo-Json -Compress
+$webhook | curl.exe -sS -i -X POST http://127.0.0.1:8000/webhooks/bank -H 'Content-Type: application/json' --data-binary '@-'
+
+# succeeded -> failed запрещён: 409 {"error":"invalid_transition"}.
+$invalidWebhook = @{ payment_id = $payment.id; status = 'failed' } | ConvertTo-Json -Compress
+$invalidWebhook | curl.exe -sS -i -X POST http://127.0.0.1:8000/webhooks/bank -H 'Content-Type: application/json' --data-binary '@-'
+```
+
+Для standard с `KVITTO10` итог: `amount = 1791000`, `discount = 199000`,
+`schedule = [597000, 597000, 597000]`.
+Без промокода: `amount = 1990000`, `discount = 0`,
+`schedule = [663334, 663333, 663333]`.
+
+## Контракт и принятые решения
+
+| Маршрут | Результат |
+| --- | --- |
+| `GET /tariffs` | 200, список `{id, title, price}` |
+| `POST /payments` | 201 для нового; 200 при повторе с ключом |
+| `GET /payments/{id}` | 200 или 404 |
+| `POST /webhooks/bank` | 200 `{"result":"ok"}`, 404 или 409 `{"error":"invalid_transition"}` |
+
+Платёж содержит `id`, `status`, `tariff_id`, `amount`, `discount`, `method`,
+`installment_months`, `schedule`, `email`, `created_at`. Новый статус: `pending`.
+Деньги в API и PostgreSQL — целые копейки (`BIGINT` в БД). `discount` — величина
+скидки в копейках; `amount` — сумма после скидки. Промокод проверяется без учёта
+регистра, но без удаления пробелов. Для указанных тарифов скидка 10% делится точно;
+для гипотетической цены с остатком копейки скидка округляется вниз через `// 10`.
+
+График вычисляется из сохранённых суммы и срока через `divmod`: первые `remainder`
+платежей на копейку больше. Отдельной колонки графика нет, поэтому его невозможно
+рассинхронизировать с суммой. Изменение цены тарифа не меняет старые платежи.
+
+Тарифы имеют целочисленный ID, платежи — UUID. `created_at` хранится как
+`TIMESTAMPTZ`, соединения используют UTC. Для `card`/`sbp` срок и график равны `null`;
+переданный срок отклоняется с 422. Для рассрочки разрешены только целые 3, 6, 12.
+Email проверяет `EmailStr` с явно установленным `email-validator`.
+Неизвестный тариф при новом платеже — 404. Ошибки схем — 422 со стандартной
+структурой FastAPI `{"detail": [...]}`. Обработчик только `RequestValidationError`
+безопасно сериализует диагностические значения: нечисловые/бесконечные float
+представляет строками, а Unicode-суррогаты экранирует. Правила Pydantic и обработка
+настоящих серверных ошибок не изменяются.
+
+Ключ идемпотентности опционален, регистрозависим, длина 1–255 символов. Без ключа
+каждый POST создаёт новый платёж. Проверка существующего ключа происходит после
+валидации схемы, но до поиска тарифа: валидный повтор с другим телом возвращает
+первый платёж, даже если новый `tariff_id` не существует. Возвращается его текущее
+состояние, включая статус. Если схема повтора невалидна, возвращается 422.
+
+Предварительное чтение ключа ускоряет повтор, а защиту от гонки обеспечивает
+`UNIQUE(idempotency_key)` и `INSERT ... ON CONFLICT DO NOTHING RETURNING`.
+Проигравший конкурентный запрос читает победивший платёж отдельным SELECT при
+`READ COMMITTED`. Ключ фиксируется вместе с платежом в одной транзакции.
+
+Вебхук блокирует строку через `SELECT ... FOR UPDATE` до commit. Допустимы только
+`pending -> succeeded`, `pending -> failed`, `succeeded -> refunded`.
+Повтор того же статуса — запрещённый переход с 409 по буквальному условию ТЗ.
+Запрещённый переход выполняет только чтение. Для проверки значений и денег
+используются ограничения PostgreSQL, для переходов — проверка под блокировкой
+в сервисе. Прямые SQL-изменения статуса в обход сервиса не проверяют переходы.
+
+Архитектура: два ORM-класса, схемы Pydantic, один модуль сервисных операций,
+сессия на запрос. Подтверждение транзакции происходит до успешного ответа API.
+HMAC, Alembic, фильтры списка платежей и другие бонусы не реализованы.
+
+## Выполненные проверки
+
+19.10.2026: Windows PowerShell, Python 3.14.4, PostgreSQL 16, FastAPI 0.146.0,
+Pydantic 2.14.1, SQLAlchemy 2.0.55, psycopg 3.3.6, pytest 9.1.1, httpx 0.28.1,
+Starlette 0.52.1. Итоговый `python -m pytest -q`: **104 passed, 1 warning in 3.71s**
+(исходные 96 случаев и 8 новых). Добавлены сырые JSON-запросы с числовым
+переполнением, NaN и непарными Unicode-суррогатами, откат после выполненных
+INSERT/UPDATE и конкурентный INSERT после отката первой транзакции.
+`pip check`: зависимости согласованы.
+
+Предупреждение относится к alias `anyio.abc.BlockingPortal` внутри тестового клиента
+Starlette. Оно не подавляется и не является ошибкой теста. Для тестов закреплена
+ветка Starlette `<1`, сохраняющая TestClient с httpx, требуемым заданием.
+
+Приложение также запущено через Uvicorn и проверено по HTTP. Полный пример
+`curl.exe` с созданием, повтором, скидкой, рассрочкой и вебхуками выполнен на
+`kvitto_test`. В основной БД проверены startup, тарифы, OpenAPI, Swagger и 404/422;
+тестовые платежи в ней не создавались. При попытке направить pytest на основную БД
+сработал защитный отказ до инициализации/очистки.
+После финальных исправлений оба проблемных сырых HTTP-запроса (`1e309` и
+`"\ud800"`) повторены через Uvicorn на `kvitto_test`: оба вернули 422 с `detail`,
+платежи не созданы.
