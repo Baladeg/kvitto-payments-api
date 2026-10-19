@@ -8,7 +8,6 @@ from sqlalchemy.orm import Session
 from app.models import Payment, Tariff
 from app.schemas import PaymentCreate, PaymentStatus
 
-
 ALLOWED_TRANSITIONS = {
     ("pending", "succeeded"),
     ("pending", "failed"),

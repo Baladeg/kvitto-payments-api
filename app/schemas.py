@@ -11,7 +11,6 @@ from pydantic import (
     model_validator,
 )
 
-
 PaymentMethod = Literal["card", "sbp", "installment"]
 PaymentStatus = Literal["pending", "succeeded", "failed", "refunded"]
 PositiveId = Annotated[int, Field(strict=True, gt=0, le=2_147_483_647)]

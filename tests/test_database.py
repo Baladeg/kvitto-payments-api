@@ -20,9 +20,8 @@ def test_postgresql_rejects_invalid_payment(engine, tariffs, changes):
         "discount": 0, "status": "pending", "method": "card", "installment_months": None,
         "email": "student@example.com", **changes,
     }
-    with pytest.raises(IntegrityError):
-        with engine.begin() as connection:
-            connection.execute(Payment.__table__.insert().values(**values))
+    with pytest.raises(IntegrityError), engine.begin() as connection:
+        connection.execute(Payment.__table__.insert().values(**values))
 
 
 def test_postgresql_unique_idempotency_key(engine, tariffs):
@@ -30,16 +29,14 @@ def test_postgresql_unique_idempotency_key(engine, tariffs):
         "tariff_id": tariffs["standard"]["id"], "amount": 1_990_000, "discount": 0,
         "method": "card", "email": "student@example.com", "idempotency_key": "unique-key",
     }
-    with pytest.raises(IntegrityError):
-        with engine.begin() as connection:
-            connection.execute(Payment.__table__.insert().values(**values))
-            connection.execute(Payment.__table__.insert().values(**values))
+    with pytest.raises(IntegrityError), engine.begin() as connection:
+        connection.execute(Payment.__table__.insert().values(**values))
+        connection.execute(Payment.__table__.insert().values(**values))
 
 
 def test_postgresql_rejects_nonpositive_tariff(engine):
-    with pytest.raises(IntegrityError):
-        with engine.begin() as connection:
-            connection.execute(Tariff.__table__.insert().values(title="invalid", price=0))
+    with pytest.raises(IntegrityError), engine.begin() as connection:
+        connection.execute(Tariff.__table__.insert().values(title="invalid", price=0))
 
 
 def test_actual_database_and_money_column_types(engine):

@@ -1,4 +1,7 @@
+import hmac
+import json
 import os
+import secrets
 from pathlib import Path
 
 import pytest
@@ -40,10 +43,36 @@ def test_database_url():
 
 
 @pytest.fixture(scope="session")
-def client(test_database_url):
+def webhook_secret():
+    secret = secrets.token_hex(32)
+    with pytest.MonkeyPatch.context() as environment:
+        environment.setenv("WEBHOOK_SECRET", secret)
+        yield secret
+
+
+@pytest.fixture(scope="session")
+def client(test_database_url, webhook_secret):
     application = create_app(test_database_url)
     with TestClient(application) as test_client:
         yield test_client
+
+
+@pytest.fixture
+def sign_webhook(webhook_secret):
+    def sign(body: bytes) -> dict[str, str]:
+        return {
+            "Content-Type": "application/json",
+            "X-Signature": hmac.new(webhook_secret.encode("utf-8"), body, "sha256").hexdigest(),
+        }
+    return sign
+
+
+@pytest.fixture
+def post_webhook(client, sign_webhook):
+    def post(data):
+        body = json.dumps(data, separators=(",", ":")).encode("utf-8")
+        return client.post("/webhooks/bank", content=body, headers=sign_webhook(body))
+    return post
 
 
 @pytest.fixture(scope="session")
