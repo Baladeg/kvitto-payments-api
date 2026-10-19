@@ -7,7 +7,6 @@ from sqlalchemy.orm import Session
 
 from app.models import Base, Tariff
 
-
 TARIFFS = [
     {"title": "basic", "price": 990_000},
     {"title": "standard", "price": 1_990_000},

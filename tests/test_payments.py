@@ -1,6 +1,6 @@
+import json
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
-import json
 from threading import Barrier, Event
 from time import monotonic, sleep
 from uuid import UUID, uuid4
@@ -42,7 +42,7 @@ def test_amount_and_full_payment_contract(client, tariffs, title, promo_code):
     assert body["installment_months"] is None
     assert body["schedule"] is None
     assert body["email"] == payload["email"]
-    timestamp = datetime.fromisoformat(body["created_at"].replace("Z", "+00:00"))
+    timestamp = datetime.fromisoformat(body["created_at"])
     assert timestamp.utcoffset().total_seconds() == 0
     assert client.get(f"/payments/{body['id']}").json() == body
 
@@ -172,10 +172,10 @@ def test_sequential_idempotency_and_changed_body(client, payment_payload, engine
     assert payment_count(engine) == 1
 
 
-def test_replay_returns_current_status(client, payment_payload):
+def test_replay_returns_current_status(client, payment_payload, post_webhook):
     headers = {"Idempotency-Key": "updated-payment"}
     first = client.post("/payments", json=payment_payload, headers=headers).json()
-    assert client.post("/webhooks/bank", json={
+    assert post_webhook({
         "payment_id": first["id"], "status": "succeeded",
     }).status_code == 200
     replay = client.post("/payments", json=payment_payload, headers=headers)

@@ -1,7 +1,8 @@
 # Квитто: платёжный REST API
 
-Обязательная часть тестового задания: Python 3.11+, FastAPI, Pydantic v2,
-PostgreSQL 16, синхронный SQLAlchemy 2.0, psycopg 3, pytest и httpx.
+Тестовое задание: Python 3.11+, FastAPI, Pydantic v2, PostgreSQL 16, синхронный
+SQLAlchemy 2.0, psycopg 3, pytest и httpx. Дополнительно реализованы HMAC вебхуков,
+GitHub Actions с Ruff и pytest, а также правила для ассистентов в AGENTS.md.
 
 ## Запуск в Windows PowerShell
 
@@ -13,6 +14,7 @@ ExecutionPolicy не нужно.
 py -3 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -e '.[test]'
 if (-not (Test-Path .env)) { Copy-Item .env.example .env }
+# Настройте WEBHOOK_SECRET в .env: пример содержит только демонстрационный ключ.
 docker compose up -d --wait db
 docker compose ps
 .\.venv\Scripts\python.exe -m uvicorn app.main:app --env-file .env --host 127.0.0.1 --port 8000
@@ -28,6 +30,20 @@ docker compose ps
 `127.0.0.1:5433`, пользователь `kvitto`, основная БД `kvitto`.
 Локальный пароль из Compose предназначен для разработки. `.env` игнорируется Git.
 Переменные окружения PowerShell имеют приоритет над значениями `.env`.
+
+`WEBHOOK_SECRET` обязателен: при отсутствующем, пустом или состоящем только из
+пробелов значении приложение завершает startup с явной ошибкой до подключения
+к БД. Проверка подписи никогда не отключается автоматически. Значение
+`demo-only-change-before-use` в `.env.example` предназначено только для локального
+примера. Для реальных запросов задайте свой случайный секрет в игнорируемом `.env`
+или окружении процесса; после изменения перезапустите приложение. Например,
+сгенерировать значение в своей консоли можно командой:
+
+```powershell
+.\.venv\Scripts\python.exe -c "import secrets; print(secrets.token_hex(32))"
+```
+
+Не сохраняйте сгенерированный ключ в README, AI_LOG или других отслеживаемых файлах.
 
 На старте создаются отсутствующие таблицы и добавляются тарифы. Повторный запуск
 обновляет канонические цены по уникальному названию без создания дубликатов.
@@ -46,6 +62,8 @@ if (($databaseExists -join '').Trim() -ne '1') {
     if ($LASTEXITCODE -ne 0) { throw 'Не удалось создать kvitto_test' }
 }
 .\.venv\Scripts\python.exe -m pytest -q
+.\.venv\Scripts\python.exe -m ruff check .
+.\.venv\Scripts\python.exe -m pip check
 ```
 
 Тесты читают `TEST_DATABASE_URL` из окружения или `.env`. Значение по умолчанию:
@@ -62,6 +80,10 @@ if (($databaseExists -join '').Trim() -ne '1') {
 Покрыты деньги и промокоды, полный ответ платежа, все сроки рассрочки,
 валидация, повторные и конкурентные запросы с ключом, все 16 пар статусов,
 конкурирующие вебхуки, 404 и ограничения реальной PostgreSQL.
+Прежние сценарии вебхуков теперь отправляются с действительной подписью. Тесты
+создают временный случайный `WEBHOOK_SECRET` в памяти и не используют реальный
+ключ разработчика. Отдельно проверяются корректные/некорректные подписи,
+неизменность платежа при 401, исходные байты тела и отказ запуска без секрета.
 
 ## Примеры запросов в PowerShell
 
@@ -88,13 +110,60 @@ $body | curl.exe -sS -i -X POST http://127.0.0.1:8000/payments -H 'Content-Type:
 # Повтор: 200, тот же платёж. Его ID нужен для следующих запросов.
 $payment = ($body | curl.exe -sS -X POST http://127.0.0.1:8000/payments -H 'Content-Type: application/json' -H 'Idempotency-Key: powershell-demo-1' --data-binary '@-') | ConvertFrom-Json
 curl.exe -i "http://127.0.0.1:8000/payments/$($payment.id)"
+```
+
+## Подписанный банковский вебхук в PowerShell
+
+`X-Signature` — 64 шестнадцатеричных символа HMAC-SHA256, без префикса `sha256=`.
+Секрет кодируется в UTF-8. Проверяется исходное тело HTTP-запроса: изменение
+пробела, порядка полей или завершающего перевода строки меняет подпись. Отсутствие,
+повреждение, повтор заголовка или неверная подпись дают 401 до валидации JSON
+и до доступа к платежу. При действительной подписи сохраняются 200/404/409/422
+и исходные правила переходов; повтор уже установленного статуса возвращает 409.
+
+Продолжите пример выше с существующим `$payment`. В этом PowerShell-процессе
+задайте тот же `WEBHOOK_SECRET`, с которым запущен сервер. Значение ниже работает
+только для неизменённого локального демонстрационного `.env.example`.
+Для собственного ключа установите соответствующую переменную окружения локально.
+
+Пример использует .NET HttpClient, чтобы **один и тот же byte[]** передавался
+в HMAC и в HTTP-тело без перекодирования и добавления перевода строки конвейером.
+Используются API .NET, доступные в Windows PowerShell 5.1 и PowerShell 7;
+фактически пример проверен в доступном PowerShell 7.6.5.
+
+```powershell
+$env:WEBHOOK_SECRET = 'demo-only-change-before-use' # Только локальная демонстрация.
+Add-Type -AssemblyName System.Net.Http
+
+function Send-SignedWebhook([string]$JsonBody) {
+    $utf8 = [System.Text.UTF8Encoding]::new($false)
+    [byte[]]$bodyBytes = $utf8.GetBytes($JsonBody)
+    $hmac = [System.Security.Cryptography.HMACSHA256]::new()
+    $http = [System.Net.Http.HttpClient]::new()
+    $content = [System.Net.Http.ByteArrayContent]::new($bodyBytes)
+    $response = $null
+    try {
+        $hmac.Key = $utf8.GetBytes($env:WEBHOOK_SECRET)
+        $signature = [System.BitConverter]::ToString($hmac.ComputeHash($bodyBytes)).Replace('-', '').ToLowerInvariant()
+        $http.DefaultRequestHeaders.Add('X-Signature', $signature)
+        $content.Headers.ContentType = [System.Net.Http.Headers.MediaTypeHeaderValue]::new('application/json')
+        $response = $http.PostAsync('http://127.0.0.1:8000/webhooks/bank', $content).GetAwaiter().GetResult()
+        '{0} {1}' -f [int]$response.StatusCode, $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+    }
+    finally {
+        if ($null -ne $response) { $response.Dispose() }
+        $content.Dispose()
+        $http.Dispose()
+        $hmac.Dispose()
+    }
+}
 
 $webhook = @{ payment_id = $payment.id; status = 'succeeded' } | ConvertTo-Json -Compress
-$webhook | curl.exe -sS -i -X POST http://127.0.0.1:8000/webhooks/bank -H 'Content-Type: application/json' --data-binary '@-'
+Send-SignedWebhook $webhook # 200 {"result":"ok"}
 
 # succeeded -> failed запрещён: 409 {"error":"invalid_transition"}.
 $invalidWebhook = @{ payment_id = $payment.id; status = 'failed' } | ConvertTo-Json -Compress
-$invalidWebhook | curl.exe -sS -i -X POST http://127.0.0.1:8000/webhooks/bank -H 'Content-Type: application/json' --data-binary '@-'
+Send-SignedWebhook $invalidWebhook
 ```
 
 Для standard с `KVITTO10` итог: `amount = 1791000`, `discount = 199000`,
@@ -109,7 +178,7 @@ $invalidWebhook | curl.exe -sS -i -X POST http://127.0.0.1:8000/webhooks/bank -H
 | `GET /tariffs` | 200, список `{id, title, price}` |
 | `POST /payments` | 201 для нового; 200 при повторе с ключом |
 | `GET /payments/{id}` | 200 или 404 |
-| `POST /webhooks/bank` | 200 `{"result":"ok"}`, 404 или 409 `{"error":"invalid_transition"}` |
+| `POST /webhooks/bank` | 401 при неверной подписи; с подписью — 200 `{"result":"ok"}`, 404, 409 `{"error":"invalid_transition"}` или 422 |
 
 Платёж содержит `id`, `status`, `tariff_id`, `amount`, `discount`, `method`,
 `installment_months`, `schedule`, `email`, `created_at`. Новый статус: `pending`.
@@ -152,9 +221,20 @@ Email проверяет `EmailStr` с явно установленным `emai
 
 Архитектура: два ORM-класса, схемы Pydantic, один модуль сервисных операций,
 сессия на запрос. Подтверждение транзакции происходит до успешного ответа API.
-HMAC, Alembic, фильтры списка платежей и другие бонусы не реализованы.
+Alembic, фильтры списка платежей и контейнеризация API не реализованы.
 
-## Выполненные проверки
+## GitHub Actions
+
+`.github/workflows/ci.yml` запускается на push и pull_request. Ubuntu runner
+использует Python 3.13 и отдельный PostgreSQL 16 с healthcheck. В сервисе создаётся
+`kvitto_test`; DATABASE_URL и TEST_DATABASE_URL направлены исключительно в неё.
+Сначала выполняется `ruff check .`, затем полный `pytest`, затем `pip check`.
+Любая ошибка останавливает job. PostgreSQL и окружение отдельные для каждого job;
+конкурентные запросы внутри pytest используют настоящий сервер БД. Предупреждения
+не подавляются. Секрет вебхука для тестов генерируется фикстурой в памяти, поэтому
+для CI не нужен реальный WEBHOOK_SECRET или GitHub Secret.
+
+## Проверки обязательной части до бонусов
 
 19.10.2026: Windows PowerShell, Python 3.14.4, PostgreSQL 16, FastAPI 0.146.0,
 Pydantic 2.14.1, SQLAlchemy 2.0.55, psycopg 3.3.6, pytest 9.1.1, httpx 0.28.1,
@@ -176,3 +256,18 @@ Starlette. Оно не подавляется и не является ошиб�
 После финальных исправлений оба проблемных сырых HTTP-запроса (`1e309` и
 `"\ud800"`) повторены через Uvicorn на `kvitto_test`: оба вернули 422 с `detail`,
 платежи не созданы.
+
+## Проверки бонусной ветки
+
+19.10.2026, ветка `feat/bonus-hmac-ci` от обновлённой `origin/main` (`30d8f5f`).
+Локально Python 3.14.4, PostgreSQL 16: **125 passed, 1 warning in 4.82s**.
+Сохранены исходные 104 случая и добавлен 21 случай HMAC/конфигурации. Ruff 0.17.1:
+`All checks passed!`; `pip check`: `No broken requirements found`.
+
+Через Uvicorn на `kvitto_test` проверены подписанные 200 и 409 из PowerShell-примера,
+а также отсутствующая, неверная и повреждённая подпись: 401 без изменения платежа.
+Проверены все прежние конкурентные сценарии и откаты. AST-сравнение подтвердило
+неизменность бизнес-моделей, схем, функций БД и транзакционных сервисов; в части
+этих файлов Ruff исправил только оформление импортов. Предупреждение
+Starlette/AnyIO осталось видимым. YAML workflow разобран и проверен локально;
+сам workflow на GitHub/Python 3.13 пока не запускался, поскольку ветка не отправлялась.

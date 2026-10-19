@@ -1,27 +1,58 @@
-from contextlib import asynccontextmanager
+import hmac
 import json
+import re
+from collections.abc import Awaitable, Callable
+from contextlib import asynccontextmanager
 from math import isfinite
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import Depends, FastAPI, Header, Request, Response
+from fastapi import (
+    APIRouter,
+    Depends,
+    FastAPI,
+    Header,
+    HTTPException,
+    Request,
+    Response,
+)
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from fastapi.routing import APIRoute
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
-from app.config import get_database_url
+from app.config import get_database_url, get_webhook_secret
 from app.db import get_session, initialize_database, make_engine
 from app.models import Tariff
 from app.schemas import BankWebhook, PaymentCreate, PaymentRead, TariffRead
 from app.services import change_payment_status, create_payment, get_payment
 
-
 SessionDependency = Annotated[Session, Depends(get_session)]
 IdempotencyKey = Annotated[
     str | None, Header(alias="Idempotency-Key", min_length=1, max_length=255)
 ]
+
+
+class SignedBankWebhookRoute(APIRoute):
+    def get_route_handler(self) -> Callable[[Request], Awaitable[Response]]:
+        handler = super().get_route_handler()
+
+        async def signed_handler(request: Request) -> Response:
+            # Routing has already selected this endpoint; JSON parsing has not begun.
+            signatures = request.headers.getlist("X-Signature")
+            signature = signatures[0] if len(signatures) == 1 else ""
+            if re.fullmatch(r"[0-9a-fA-F]{64}", signature) is None:
+                raise HTTPException(status_code=401, detail="Invalid webhook signature")
+            expected = hmac.digest(
+                request.app.state.webhook_secret, await request.body(), "sha256"
+            )
+            if not hmac.compare_digest(bytes.fromhex(signature), expected):
+                raise HTTPException(status_code=401, detail="Invalid webhook signature")
+            return await handler(request)
+
+        return signed_handler
 
 
 async def request_validation_error_handler(
@@ -45,6 +76,7 @@ async def request_validation_error_handler(
 def create_app(database_url: str | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(application: FastAPI):
+        application.state.webhook_secret = get_webhook_secret()
         engine = make_engine(database_url or get_database_url())
         try:
             initialize_database(engine)
@@ -80,7 +112,9 @@ def create_app(database_url: str | None = None) -> FastAPI:
     def read_payment(id: UUID, session: SessionDependency):
         return PaymentRead.model_validate(get_payment(session, id))
 
-    @application.post("/webhooks/bank")
+    bank_webhooks = APIRouter(route_class=SignedBankWebhookRoute)
+
+    @bank_webhooks.post("/webhooks/bank")
     def bank_webhook(data: BankWebhook, session: SessionDependency):
         if not change_payment_status(session, data.payment_id, data.status):
             return JSONResponse(
@@ -88,6 +122,7 @@ def create_app(database_url: str | None = None) -> FastAPI:
             )
         return {"result": "ok"}
 
+    application.include_router(bank_webhooks)
     return application
 
 

@@ -10,11 +10,11 @@ from app.models import Payment
 
 @pytest.mark.parametrize("source", ["pending", "succeeded", "failed", "refunded"])
 @pytest.mark.parametrize("target", ["pending", "succeeded", "failed", "refunded"])
-def test_all_status_transitions(client, payment, engine, source, target):
+def test_all_status_transitions(client, payment, engine, source, target, post_webhook):
     with engine.begin() as connection:
         connection.execute(update(Payment).where(Payment.id == UUID(payment["id"])).values(status=source))
     before = client.get(f"/payments/{payment['id']}").json()
-    response = client.post("/webhooks/bank", json={"payment_id": payment["id"], "status": target})
+    response = post_webhook({"payment_id": payment["id"], "status": target})
     after = client.get(f"/payments/{payment['id']}").json()
     allowed = {
         ("pending", "succeeded"), ("pending", "failed"), ("succeeded", "refunded"),
@@ -29,21 +29,21 @@ def test_all_status_transitions(client, payment, engine, source, target):
         assert after == before
 
 
-def test_success_then_refund(client, payment):
+def test_success_then_refund(client, payment, post_webhook):
     for status in ("succeeded", "refunded"):
-        response = client.post("/webhooks/bank", json={"payment_id": payment["id"], "status": status})
+        response = post_webhook({"payment_id": payment["id"], "status": status})
         assert response.status_code == 200
     assert client.get(f"/payments/{payment['id']}").json()["status"] == "refunded"
 
 
-def test_unknown_webhook_payment(client):
-    response = client.post("/webhooks/bank", json={"payment_id": str(uuid4()), "status": "succeeded"})
+def test_unknown_webhook_payment(post_webhook):
+    response = post_webhook({"payment_id": str(uuid4()), "status": "succeeded"})
     assert response.status_code == 404
 
 
 @pytest.mark.parametrize("changes", [{"status": "unknown"}, {"payment_id": "bad"}])
-def test_invalid_webhook(client, payment, changes):
-    response = client.post("/webhooks/bank", json={
+def test_invalid_webhook(client, payment, changes, post_webhook):
+    response = post_webhook({
         "payment_id": payment["id"], "status": "succeeded", **changes,
     })
     assert response.status_code == 422
@@ -51,7 +51,7 @@ def test_invalid_webhook(client, payment, changes):
     assert client.get(f"/payments/{payment['id']}").json() == payment
 
 
-def test_concurrent_conflicting_webhooks(client, payment, engine):
+def test_concurrent_conflicting_webhooks(client, payment, engine, post_webhook):
     select_barrier = Barrier(2)
 
     def before_lock(connection, cursor, statement, parameters, context, executemany):
@@ -59,7 +59,7 @@ def test_concurrent_conflicting_webhooks(client, payment, engine):
             select_barrier.wait(timeout=15)
 
     def send_request(target):
-        return target, client.post("/webhooks/bank", json={"payment_id": payment["id"], "status": target})
+        return target, post_webhook({"payment_id": payment["id"], "status": target})
 
     event.listen(engine, "before_cursor_execute", before_lock)
     try:
@@ -75,7 +75,7 @@ def test_concurrent_conflicting_webhooks(client, payment, engine):
     assert client.get(f"/payments/{payment['id']}").json() == {**payment, "status": winner}
 
 
-def test_webhook_rolls_back_after_executed_update(client, payment, engine):
+def test_webhook_rolls_back_after_executed_update(client, payment, engine, post_webhook):
     executed = []
     payload = {"payment_id": payment["id"], "status": "succeeded"}
 
@@ -87,14 +87,14 @@ def test_webhook_rolls_back_after_executed_update(client, payment, engine):
     event.listen(engine, "after_cursor_execute", fail_after_update)
     try:
         with pytest.raises(RuntimeError, match="Injected failure after payment UPDATE"):
-            client.post("/webhooks/bank", json=payload)
+            post_webhook(payload)
     finally:
         event.remove(engine, "after_cursor_execute", fail_after_update)
 
     assert len(executed) == 1
     assert client.get(f"/payments/{payment['id']}").json() == payment
     assert engine.pool.checkedout() == 0
-    retry = client.post("/webhooks/bank", json=payload)
+    retry = post_webhook(payload)
     assert retry.status_code == 200
     assert retry.json() == {"result": "ok"}
     assert client.get(f"/payments/{payment['id']}").json()["status"] == "succeeded"

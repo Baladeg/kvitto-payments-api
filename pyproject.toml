@@ -23,6 +23,7 @@ test = [
     "httpx>=0.28,<1",
     # Starlette 1.x deprecates TestClient with httpx in favor of httpx2.
     "starlette>=0.46,<1",
+    "ruff>=0.11,<1",
 ]
 
 [tool.setuptools.packages.find]
@@ -31,3 +32,6 @@ include = ["app*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"
+
+[tool.ruff]
+target-version = "py311"
